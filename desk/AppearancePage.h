@@ -40,6 +40,7 @@ private:
 	bool FillSchemeDataMap(LPCWSTR theme, ULONG index);
 	void _UpdateColorBox(LPWSTR data);
 	void _UpdateFontBox(LPWSTR data);
+	LPCWSTR SelectedMsstyleSizeName();
 	void _FixColorBox();
 	int _FindCurrentIndex();
 	void _FilterHiddenThemes();
@@ -52,6 +53,8 @@ private:
 	SIZE size;
 	std::vector<LPWSTR> msstyle;
 	std::vector<std::wstring> msstyleGroups;
+	// internal size names of the msstyle size combobox items (item data indexes this).
+	std::vector<std::wstring> msstyleSizeNames;
 	Microsoft::WRL::ComPtr<IWindowPreview> pWndPreview;
 	SCHEMEDATA* schemeMap = NULL;
 	SCHEMEDATA* currentRegistryScheme = NULL;

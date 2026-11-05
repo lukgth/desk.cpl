@@ -290,27 +290,19 @@ static std::wstring MsstyleGroupPath(LPCWSTR stylePath)
 	if (!ResolveMsstylePath(stylePath, resolved) || !PathRemoveFileSpecW(resolved))
 		return {};
 
-	// Only styles directly in the installed XP-era category folders get their
-	// own group. Other files, including styles outside the system Themes tree,
-	// share the Custom group while retaining their individual color entries.
+	// Every folder directly in %windir%\Resources\Themes is a style of its own,
+	// the way XP listed each folder of Resources\Themes: Luna, Royale and the
+	// ported themes (one folder, one .msstyles per color scheme). Styles living
+	// anywhere else share the Custom group while retaining their own color entries.
 	WCHAR windowsDirectory[MAX_PATH] = {};
-	WCHAR categoryPath[MAX_PATH] = {};
-	if (GetWindowsDirectoryW(windowsDirectory, ARRAYSIZE(windowsDirectory)))
-	{
-		const UINT categoryFolders[] = {
-			IDS_XP_STYLE_FOLDER, IDS_ROYALE_STYLE_FOLDER,
-			IDS_ZUNE, IDS_EMBEDDED_STYLE_FOLDER
-		};
-		for (UINT folderId : categoryFolders)
-		{
-			std::wstring folder = LoadDeskString(folderId);
-			if (!folder.empty() && SUCCEEDED(StringCchPrintfW(categoryPath,
-				ARRAYSIZE(categoryPath), L"%s\\Resources\\Themes\\%s",
-				windowsDirectory, folder.c_str())) &&
-				StrCmpIW(resolved, categoryPath) == 0)
-				return resolved;
-		}
-	}
+	WCHAR themesPath[MAX_PATH] = {};
+	WCHAR parent[MAX_PATH] = {};
+	if (GetWindowsDirectoryW(windowsDirectory, ARRAYSIZE(windowsDirectory)) &&
+		SUCCEEDED(StringCchPrintfW(themesPath, ARRAYSIZE(themesPath),
+			L"%s\\Resources\\Themes", windowsDirectory)) &&
+		SUCCEEDED(StringCchCopyW(parent, ARRAYSIZE(parent), resolved)) &&
+		PathRemoveFileSpecW(parent) && StrCmpIW(parent, themesPath) == 0)
+		return resolved;
 	return APPEARANCE_CUSTOM_STYLE;
 }
 
@@ -319,6 +311,29 @@ static bool MsstyleBelongsToGroup(LPCWSTR stylePath, LPCWSTR groupPath)
 	if (!groupPath || !groupPath[0]) return false;
 	std::wstring parent = MsstyleGroupPath(stylePath);
 	return !parent.empty() && StrCmpIW(parent.c_str(), groupPath) == 0;
+}
+
+// The documentation DisplayName of the first style in a folder that has one;
+// the ported themes carry the xp theme's name there ("Clearlooks06", "Flarn VS").
+static std::wstring MsstyleFolderDisplayName(LPCWSTR groupPath)
+{
+	WCHAR pattern[MAX_PATH] = {};
+	if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*.msstyles", groupPath)))
+		return {};
+	WIN32_FIND_DATAW fd = {};
+	HANDLE find = FindFirstFileW(pattern, &fd);
+	if (find == INVALID_HANDLE_VALUE) return {};
+	std::wstring result;
+	do
+	{
+		WCHAR file[MAX_PATH] = {};
+		WCHAR name[MAX_PATH] = {};
+		if (SUCCEEDED(StringCchPrintfW(file, ARRAYSIZE(file), L"%s\\%s", groupPath, fd.cFileName)) &&
+			SUCCEEDED(GetThemeDocumentationProperty(file, L"DisplayName", name, ARRAYSIZE(name))) && name[0])
+			result = name;
+	} while (result.empty() && FindNextFileW(find, &fd));
+	FindClose(find);
+	return result;
 }
 
 static std::wstring MsstyleGroupLabel(LPCWSTR groupPath)
@@ -330,6 +345,20 @@ static std::wstring MsstyleGroupLabel(LPCWSTR groupPath)
 		return LoadDeskString(IDS_WINDOWS_XP_STYLE);
 	if (StrCmpIW(folder, LoadDeskString(IDS_ROYALE_STYLE_FOLDER).c_str()) == 0)
 		return LoadDeskString(IDS_ROYALE_STYLE);
+	// the shipped category folders keep their "<folder> style" label; a
+	// ported theme is listed under its own name.
+	const UINT categoryFolders[] = { IDS_ZUNE, IDS_EMBEDDED_STYLE_FOLDER };
+	bool category = false;
+	for (UINT folderId : categoryFolders)
+		category = category || StrCmpIW(folder, LoadDeskString(folderId).c_str()) == 0;
+	if (!category)
+	{
+		// older ports still carry Luna10's documentation name; that isn't theirs, the folder is.
+		std::wstring display = MsstyleFolderDisplayName(groupPath);
+		if (!display.empty() && StrCmpIW(display.c_str(), L"Default (blue)") != 0)
+			return display;
+		return folder;
+	}
 	WCHAR label[MAX_PATH] = {};
 	std::wstring format = LoadDeskString(IDS_STYLE_FORMAT);
 	if (FAILED(StringCchPrintfW(label, ARRAYSIZE(label), format.c_str(), folder)))
@@ -354,7 +383,54 @@ static HANDLE LoadCurrentMsstyleVariant(LPCWSTR stylePath)
 	return LoadThemeFromFilePath(stylePath);
 }
 
-static HRESULT ApplyMsstyleWithoutChangingWallpaper(HWND hwnd, LPCWSTR stylePath)
+// XP's uxtheme (loader.cpp SetSystemMetrics) finished every visual style apply
+// with SetSysColors(all, theme colors) and persisted them. Windows 10 doesn't, so
+// a style applied without a .theme kept the previous palette: GSM "three" ran
+// with GSM "four"'s light WINDOW/WINDOWTEXT and looked broken.
+static void ApplyMsstyleSystemColors(LPCWSTR stylePath, LPCWSTR colorName, LPCWSTR sizeName)
+{
+	HANDLE theme = LoadThemeFromFilePath(stylePath, colorName, sizeName);
+	if (!theme) return;
+	HTHEME window = OpenNcThemeData(theme, L"Window");
+	if (window)
+	{
+		// TM_COLORCOUNT in XP's uxtheme: all 31, MENUHILIGHT and MENUBAR included
+		// (deskcpl's MAX_COLORS stops at 29, the classic scheme format).
+		constexpr int ThemeColorCount = COLOR_MENUBAR + 1;
+		int elements[ThemeColorCount] = {};
+		COLORREF colors[ThemeColorCount] = {};
+		for (int i = 0; i < ThemeColorCount; ++i)
+		{
+			elements[i] = i;
+			colors[i] = GetThemeSysColor(window, i);
+		}
+		SetSysColors(ThemeColorCount, elements, colors);
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Colors", 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS)
+		{
+			static const LPCWSTR names[ThemeColorCount] = {
+				L"Scrollbar", L"Background", L"ActiveTitle", L"InactiveTitle", L"Menu", L"Window",
+				L"WindowFrame", L"MenuText", L"WindowText", L"TitleText", L"ActiveBorder", L"InactiveBorder",
+				L"AppWorkspace", L"Hilight", L"HilightText", L"ButtonFace", L"ButtonShadow", L"GrayText",
+				L"ButtonText", L"InactiveTitleText", L"ButtonHilight", L"ButtonDkShadow", L"ButtonLight",
+				L"InfoText", L"InfoWindow", L"ButtonAlternateFace", L"HotTrackingColor",
+				L"GradientActiveTitle", L"GradientInactiveTitle", L"MenuHilight", L"MenuBar" };
+			for (int i = 0; i < ThemeColorCount; ++i)
+			{
+				WCHAR value[16] = {};
+				StringCchPrintfW(value, ARRAYSIZE(value), L"%d %d %d",
+					GetRValue(colors[i]), GetGValue(colors[i]), GetBValue(colors[i]));
+				RegSetValueExW(key, names[i], 0, REG_SZ, (const BYTE*)value, (lstrlenW(value) + 1) * sizeof(WCHAR));
+			}
+			RegCloseKey(key);
+		}
+		CloseThemeData(window);
+	}
+	CleanupThemeFile(&theme);
+}
+
+// requestedSize: one of the style's size variants; null or empty = the style's default size.
+static HRESULT ApplyMsstyleWithoutChangingWallpaper(HWND hwnd, LPCWSTR stylePath, LPCWSTR requestedSize = nullptr)
 {
 	if (!pThemeManager || !GetThemeDefaults || !stylePath || !PathFileExistsW(stylePath))
 		return E_INVALIDARG;
@@ -364,6 +440,18 @@ static HRESULT ApplyMsstyleWithoutChangingWallpaper(HWND hwnd, LPCWSTR stylePath
 	HRESULT hr = GetThemeDefaults(stylePath, colorName, ARRAYSIZE(colorName),
 		sizeName, ARRAYSIZE(sizeName));
 	if (FAILED(hr)) return hr;
+	// A .theme names no size, so Theme Manager applies whichever size is
+	// recorded and leaves SizeName alone: a chosen Font size, default
+	// included, goes straight to uxtheme.
+	if (requestedSize && requestedSize[0])
+	{
+		hr = SetSystemVisualStyle
+			? SetSystemVisualStyle(stylePath, colorName, requestedSize,
+				(ApplyThemeFlags)(AT_FORCE_GLOBAL | AT_SET_METRICS))
+			: E_UNEXPECTED;
+		if (SUCCEEDED(hr)) ApplyMsstyleSystemColors(stylePath, colorName, requestedSize);
+		return hr;
+	}
 
 	int themeCount = 0;
 	hr = pThemeManager->GetThemeCount(&themeCount);
@@ -383,15 +471,21 @@ static HRESULT ApplyMsstyleWithoutChangingWallpaper(HWND hwnd, LPCWSTR stylePath
 		ExpandEnvironmentStringsW(candidatePath, expandedCandidate, ARRAYSIZE(expandedCandidate));
 		ExpandEnvironmentStringsW(stylePath, expandedSelected, ARRAYSIZE(expandedSelected));
 		if (StrCmpI(expandedCandidate, expandedSelected) == 0)
-			return pThemeManager->SetCurrentTheme(hwnd, index, TRUE,
+		{
+			hr = pThemeManager->SetCurrentTheme(hwnd, index, TRUE,
 				THEMETOOL_APPLY_FLAG_IGNORE_BACKGROUND, 0);
+			if (SUCCEEDED(hr)) ApplyMsstyleSystemColors(stylePath, colorName, sizeName);
+			return hr;
+		}
 	}
 
 	// No installed .theme entry points at this style; apply the .msstyles itself.
-	return SetSystemVisualStyle
+	hr = SetSystemVisualStyle
 		? SetSystemVisualStyle(stylePath, colorName, sizeName,
 			(ApplyThemeFlags)(AT_FORCE_GLOBAL | AT_SET_METRICS))
 		: E_UNEXPECTED;
+	if (SUCCEEDED(hr)) ApplyMsstyleSystemColors(stylePath, colorName, sizeName);
+	return hr;
 }
 
 static HRESULT ApplyClassicThemeWithoutChangingWallpaper(HWND hwnd)
@@ -1063,6 +1157,21 @@ BOOL CAppearanceDlgProc::OnFontComboboxChange(UINT code, UINT id, HWND hWnd, BOO
 {
 	advancedAppearancePending = false;
 	int i = ComboBox_GetCurSel(hSizeCombobox);
+	if (selectedTheme->szMsstylePath != APPEARANCE_CLASSIC_STYLE)
+	{
+		// a visual style's sizes are its variants; the item data is 1 + index
+		// into msstyleSizeNames. The metrics Apply writes after the style (fonts,
+		// caption sizes) and the preview both come from that variant.
+		HBITMAP ebmp;
+		LPCWSTR sizeName = SelectedMsstyleSizeName();
+		HANDLE variant = LoadThemeFromFilePath(selectedTheme->szMsstylePath.c_str(), nullptr, sizeName);
+		if (variant) CreateThemedMetricsScheme(GetDpiForWindow(m_hWnd), variant);
+		pWndPreview->GetUpdatedPreviewImage(wnd, variant, &ebmp, UPDATE_SOLIDCLR | UPDATE_WINDOW);
+		SetBitmap(hPreviewWnd, ebmp);
+		SetModified(TRUE);
+		appearanceApplyPending = true;
+		return 0;
+	}
 	SCHEMEDATA* data = (SCHEMEDATA*)ComboBox_GetItemData(hSizeCombobox, i);
 
 	if (selectedTheme->selectedScheme &&
@@ -1085,6 +1194,16 @@ BOOL CAppearanceDlgProc::OnFontComboboxChange(UINT code, UINT id, HWND hWnd, BOO
 	SetModified(TRUE);
 	appearanceApplyPending = true;
 	return 0;
+}
+
+// The chosen msstyle size, or null when the style has only one (nothing to pick,
+// so Apply keeps going through Theme Manager like before).
+LPCWSTR CAppearanceDlgProc::SelectedMsstyleSizeName()
+{
+	if (msstyleSizeNames.size() < 2) return nullptr;
+	const int i = ComboBox_GetCurSel(hSizeCombobox);
+	const LRESULT data = i == CB_ERR ? 0 : ComboBox_GetItemData(hSizeCombobox, i);
+	return data > 0 && (size_t)data <= msstyleSizeNames.size() ? msstyleSizeNames[data - 1].c_str() : nullptr;
 }
 
 BOOL CAppearanceDlgProc::OnSetActive()
@@ -1194,7 +1313,7 @@ BOOL CAppearanceDlgProc::OnApply()
 	if (applyXpStyle)
 	{
 		themeApplyResult = ApplyMsstyleWithoutChangingWallpaper(m_hWnd,
-			selectedTheme->szMsstylePath.c_str());
+			selectedTheme->szMsstylePath.c_str(), SelectedMsstyleSizeName());
 	}
 	else if (!classicToClassic)
 	{
@@ -1394,7 +1513,16 @@ void CAppearanceDlgProc::_UpdateColorBox(LPWSTR data)
 				StringCchCopyW(name, ARRAYSIZE(name),
 					LoadDeskString(IDS_SILVER_STYLE).c_str());
 			else
-				StringCchCopyW(name, ARRAYSIZE(name), styleName);
+			{
+				// a ported scheme names its color variant after the xp scheme
+				// ("Blue", "Green"); stock ports inherit Luna10's "Default".
+				_THEMENAMEINFO color = {};
+				if (EnumThemeColors && SUCCEEDED(EnumThemeColors(style, nullptr, 0, &color)) &&
+					color.szDisplayName[0] && StrCmpIW(color.szDisplayName, L"Default") != 0)
+					StringCchCopyW(name, ARRAYSIZE(name), color.szDisplayName);
+				else
+					StringCchCopyW(name, ARRAYSIZE(name), styleName);
+			}
 			int item = ComboBox_AddString(hColorCombobox, name);
 			ComboBox_SetItemData(hColorCombobox, item, (LPARAM)style);
 		}
@@ -1661,17 +1789,25 @@ void CAppearanceDlgProc::_UpdateFontBox(LPWSTR data)
 			MsstylePathsMatch(data, liveStylePath);
 		int liveSizeIndex = CB_ERR;
 
-		for (int i = 0; SUCCEEDED(hr); i++)
+		// uxtheme numbers sizes by their position among the style's sizevariant
+		// classes; a class with no VMAP entry (Luna10's sizevariant.Default)
+		// fails its index without ending the list. Ported XP styles add their
+		// Large/Extra Large Fonts after it, so probe past such gaps.
+		msstyleSizeNames.clear();
+		for (int i = 0, misses = 0; misses < 4 && i < 64; i++)
 		{
 			hr = EnumThemeSize(data, NULL, i, &name);
-			if (SUCCEEDED(hr))
-			{
-				int item = ComboBox_AddString(hSizeCombobox, name.szDisplayName);
-				if (liveVariantMatches &&
-					(StrCmpIW(name.szName, liveSizeName) == 0 ||
-					 StrCmpIW(name.szDisplayName, liveSizeName) == 0))
-					liveSizeIndex = item;
-			}
+			if (FAILED(hr)) { ++misses; continue; }
+			misses = 0;
+			// XP's themeui (baseappearpg.cpp _PopulateSizeDropDown) lists
+			// EnumThemeSizes' szDisplayName as is.
+			int item = ComboBox_AddString(hSizeCombobox, name.szDisplayName);
+			msstyleSizeNames.push_back(name.szName);
+			ComboBox_SetItemData(hSizeCombobox, item, msstyleSizeNames.size());
+			if (liveVariantMatches &&
+				(StrCmpIW(name.szName, liveSizeName) == 0 ||
+				 StrCmpIW(name.szDisplayName, liveSizeName) == 0))
+				liveSizeIndex = item;
 		}
 		ComboBox_SetCurSel(hSizeCombobox,
 			liveSizeIndex != CB_ERR ? liveSizeIndex : 0);
@@ -1717,8 +1853,6 @@ void CAppearanceDlgProc::_UpdateFontBox(LPWSTR data)
 		selectedTheme->selectedScheme = keepDerivativeMetrics
 			? currentRegistryScheme : selectedSizeScheme;
 	}
-	else
-		ComboBox_SetCurSel(hSizeCombobox, 0);
 }
 
 // rewrite this function
